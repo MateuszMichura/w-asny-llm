@@ -76,21 +76,23 @@ def run_pretraining():
     MODEL_CONFIG_PATH = "./moj_model"
     DATASET_NAME = "chrisociepa/wikipedia-pl-20230401"
     DATASET_PERCENTAGE = 100
-    NUM_PROC_MAP = 8
+    # --- ZMIANA: Użycie wszystkich dostępnych rdzeni procesora ---
+    NUM_PROC_MAP = os.cpu_count()
+    print(f"{Colors.BLUE}INFO: Wykryto {NUM_PROC_MAP} rdzeni procesora do przetwarzania danych.{Colors.ENDC}")
     NUM_LAYERS = 4
     OUTPUT_DIR = f"./wytrenowany_model_PL_{NUM_LAYERS}L"
-    
+
     # --- Architektura i Model ---
     with open(os.path.join(MODEL_CONFIG_PATH, "config.json"), 'r') as f:
         config = GemmaConfig(**json.load(f)['text_config'])
     config.num_hidden_layers = NUM_LAYERS
     model = GemmaForCausalLM(config)
     print(f"{Colors.YELLOW}   -> Model z {NUM_LAYERS} warstwami. Liczba parametrów: {sum(p.numel() for p in model.parameters()) / 1e9:.2f} mld{Colors.ENDC}")
-    
+
     # --- Tokenizer ---
     tokenizer = AutoTokenizer.from_pretrained(MODEL_CONFIG_PATH)
     if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
-    
+
     # --- Dane ---
     dataset = load_dataset(DATASET_NAME, split="train").select(range(int(len(load_dataset(DATASET_NAME, split="train")) * (DATASET_PERCENTAGE / 100))))
     def tokenize_function(e): return tokenizer(e["text"], truncation=True, max_length=BLOCK_SIZE)
@@ -107,11 +109,11 @@ def run_pretraining():
     # --- Trening ---
     training_args = TrainingArguments(output_dir=OUTPUT_DIR, overwrite_output_dir=True, num_train_epochs=1, per_device_train_batch_size=1, gradient_accumulation_steps=16, bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported(), gradient_checkpointing=True, logging_steps=20, save_steps=1000, save_total_limit=2)
     trainer = Trainer(model=model, args=training_args, train_dataset=lm_dataset, data_collator=DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False), callbacks=[ProgressCallback()])
-    
+
     print(f"\n{Colors.BOLD}{Colors.GREEN}!!! ROZPOCZYNAM PRE-TRENING !!!{Colors.ENDC}")
     trainer.train()
     print(f"\n{Colors.BOLD}{Colors.GREEN}!!! PRE-TRENING ZAKOŃCZONY !!!{Colors.ENDC}\n")
-    
+
     trainer.save_model(OUTPUT_DIR)
     tokenizer.save_pretrained(OUTPUT_DIR)
     LATEST_TRAINED_MODEL_PATH = OUTPUT_DIR
@@ -143,11 +145,11 @@ def upload_to_hub():
         print(f"\n{Colors.BLUE}Logowanie i wysyłanie plików do repozytorium '{repo_name}'...{Colors.ENDC}")
         tokenizer = AutoTokenizer.from_pretrained(model_path)
         model = GemmaForCausalLM.from_pretrained(model_path)
-        
+
         # Użycie tokena bezpośrednio w metodach push_to_hub
         tokenizer.push_to_hub(repo_id=repo_name, token=HF_TOKEN)
         model.push_to_hub(repo_id=repo_name, token=HF_TOKEN)
-        
+
         print("\n" + "="*50)
         print(f"{Colors.BOLD}{Colors.GREEN}!!! MODEL POMYŚLNIE WYSŁANY !!!{Colors.ENDC}")
         print(f"{Colors.YELLOW}Możesz go znaleźć pod adresem: https://huggingface.co/{repo_name}{Colors.ENDC}")
