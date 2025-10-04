@@ -44,6 +44,7 @@ from transformers import (
 import huggingface_hub
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+# WAŻNE: Upewnij się, że ten token ma uprawnienia do odczytu.
 HF_TOKEN = "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"
 BLOCK_SIZE = 512
 CONFIG_FILE = ".last_model_path.txt"
@@ -74,9 +75,16 @@ class ProgressCallback(TrainerCallback):
 def run_pretraining():
     global LATEST_TRAINED_MODEL_PATH
     MODEL_CONFIG_PATH = "./moj_model"
-    DATASET_NAME = "chrisociepa/wikipedia-pl-20230401"
-    DATASET_PERCENTAGE = 100
-    # --- ZMIANA: Użycie wszystkich dostępnych rdzeni procesora ---
+    
+    # --- ZMIANA: Zaktualizowano nazwę zbioru danych na CulturaX ---
+    DATASET_NAME = "uonlp/CulturaX"
+    DATASET_LANGUAGE = "pl"
+    
+    # UWAGA: Pełny polski zbiór CulturaX jest OGROMNY. Użycie 100% może zająć tygodnie/miesiące.
+    # Zmniejszono domyślną wartość do 1% dla szybszych testów. Zwiększ ją według potrzeb.
+    DATASET_PERCENTAGE = 1 
+    
+    # --- ZMIANA: Wykorzystanie wszystkich dostępnych rdzeni procesora (już było zaimplementowane) ---
     NUM_PROC_MAP = os.cpu_count()
     print(f"{Colors.BLUE}INFO: Wykryto {NUM_PROC_MAP} rdzeni procesora do przetwarzania danych.{Colors.ENDC}")
     NUM_LAYERS = 4
@@ -94,9 +102,26 @@ def run_pretraining():
     if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
 
     # --- Dane ---
-    dataset = load_dataset(DATASET_NAME, split="train").select(range(int(len(load_dataset(DATASET_NAME, split="train")) * (DATASET_PERCENTAGE / 100))))
+    print(f"{Colors.BLUE}INFO: Rozpoczynam pobieranie i przetwarzanie zbioru danych '{DATASET_NAME}', język: '{DATASET_LANGUAGE}'.{Colors.ENDC}")
+    print(f"{Colors.YELLOW}WAŻNE: Pobieranie może zająć dużo czasu przy pierwszym uruchomieniu!{Colors.ENDC}")
+    
+    # --- ZMIANA: Ładowanie konkretnego języka ze zbioru CulturaX z użyciem tokena ---
+    try:
+        full_dataset = load_dataset(DATASET_NAME, DATASET_LANGUAGE, split="train", use_auth_token=HF_TOKEN, streaming=False)
+        
+        # Wybór procentu danych
+        num_samples = int(len(full_dataset) * (DATASET_PERCENTAGE / 100))
+        dataset = full_dataset.select(range(num_samples))
+        print(f"{Colors.GREEN}✅ Pomyślnie załadowano {num_samples} próbek ({DATASET_PERCENTAGE}%) z '{DATASET_NAME}'.{Colors.ENDC}")
+
+    except Exception as e:
+        print(f"{Colors.RED}❌ BŁĄD: Nie udało się załadować zbioru danych. {e}{Colors.ENDC}")
+        print(f"{Colors.YELLOW}Upewnij się, że zaakceptowałeś warunki na stronie: https://huggingface.co/datasets/{DATASET_NAME} i że Twój token HF_TOKEN jest poprawny.{Colors.ENDC}")
+        return
+
     def tokenize_function(e): return tokenizer(e["text"], truncation=True, max_length=BLOCK_SIZE)
     tokenized_dataset = dataset.map(tokenize_function, batched=True, num_proc=NUM_PROC_MAP, remove_columns=dataset.column_names)
+    
     def group_texts(e):
         concatenated = {k: sum(e[k], []) for k in e.keys()}
         total_length = len(concatenated[list(e.keys())[0]])
@@ -121,7 +146,6 @@ def run_pretraining():
     print(f"{Colors.YELLOW}Model zapisany i zapamiętany w: {OUTPUT_DIR}{Colors.ENDC}")
 
 
-# ### NAPRAWIONA FUNKCJA WYSYŁANIA ###
 def upload_to_hub():
     """Automatycznie znajduje ostatni model i wysyła go na Hugging Face Hub."""
     print("\n" + "="*50)
