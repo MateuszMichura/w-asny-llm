@@ -47,16 +47,26 @@ from transformers import (
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 from huggingface_hub import repo_info, login
 
-# ---> PAMIĘTAJ O ZMIANIE TEGO TOKENA NA NOWY I BEZPIECZNY <---
-TWOJ_TOKEN_HUGGING_FACE = "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" 
+# ==============================================================================
+# ZMIANA: BEZPIECZNE LOGOWANIE Z UŻYCIEM ZMIENNEJ ŚRODOWISKOWEJ
+# ==============================================================================
+print("--- Logowanie do Hugging Face ---")
+hf_token = os.getenv("HUGGING_FACE_HUB_TOKEN")
+
+if hf_token is None:
+    print("\033[91m❌ BŁĄD: Zmienna środowiskowa 'HUGGING_FACE_HUB_TOKEN' nie została znaleziona.\033[0m")
+    print("\033[93mUstaw zmienną środowiskową, aby kontynuować. Instrukcje znajdziesz w dokumentacji skryptu.\033[0m")
+    sys.exit(1)
 
 try:
-    login(token=TWOJ_TOKEN_HUGGING_FACE)
-    print(f"\033[92m✅ Pomyślnie zalogowano na konto Hugging Face.\033[0m")
+    login(token=hf_token)
+    print("\033[92m✅ Pomyślnie zalogowano na konto Hugging Face przy użyciu tokena ze zmiennej środowiskowej.\033[0m")
 except Exception as e:
     print(f"\033[91m❌ BŁĄD logowania do Hugging Face: {e}\033[0m")
-    print(f"\033[93mUpewnij się, że token w zmiennej TWOJ_TOKEN_HUGGING_FACE jest poprawny.\033[0m")
+    print("\033[93mUpewnij się, że token w zmiennej środowiskowej 'HUGGING_FACE_HUB_TOKEN' jest poprawny.\033[0m")
     sys.exit(1)
+print("---------------------------------\n")
+
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
@@ -118,41 +128,26 @@ def get_dataset_info(repo_id, lang_prefix="pl/"):
 def run_pretraining():
     global LATEST_TRAINED_MODEL_PATH
     
-    # ZMIANA: Usunąłem "./" z nazwy folderu. Jest czyściej i bezpieczniej.
+    # === GŁÓWNE USTAWIENIA ===
+    # Ścieżka do folderu z config.json i tokenizer.json.
+    # Ta ścieżka oznacza, że folder 'moj_model' musi być w tym samym miejscu co skrypt .py
     MODEL_CONFIG_PATH = "moj_model"
-    BASE_MODEL_ID = "google/gemma-2b" # Model, z którego pobierzemy startową konfigurację
     DATASET_NAME = "uonlp/CulturaX"
-    NUM_LAYERS = 4
+    # ZMIENIONO LICZBĘ WARSTW
+    NUM_LAYERS = 2
     OUTPUT_DIR = f"./wytrenowany_model_PL_{NUM_LAYERS}L"
     PROCESSED_DATA_DIR = os.path.join(OUTPUT_DIR, "processed_dataset")
+    # === KONIEC USTAWIEŃ ===
 
-    # ==========================================================================
-    # ZMIANA: NOWA SEKCJA - AUTOMATYCZNE PRZYGOTOWANIE MODELU BAZOWEGO
-    # ==========================================================================
-    # Sprawdzamy, czy folder z konfiguracją istnieje i zawiera potrzebne pliki.
-    if not os.path.isdir(MODEL_CONFIG_PATH) or not os.path.exists(os.path.join(MODEL_CONFIG_PATH, "tokenizer.json")):
-        print(f"{Colors.YELLOW}INFO: Folder '{MODEL_CONFIG_PATH}' jest pusty lub nie istnieje.{Colors.ENDC}")
-        print(f"{Colors.BLUE}Pobieram pliki bazowe dla modelu '{BASE_MODEL_ID}' z Hugging Face...{Colors.ENDC}")
-        try:
-            os.makedirs(MODEL_CONFIG_PATH, exist_ok=True)
-            # Pobieramy i zapisujemy tokenizer
-            tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_ID)
-            tokenizer.save_pretrained(MODEL_CONFIG_PATH)
-            # Pobieramy i zapisujemy konfigurację w formacie wymaganym przez skrypt
-            config = GemmaConfig.from_pretrained(BASE_MODEL_ID)
-            config_dict_for_script = {"text_config": config.to_dict()}
-            with open(os.path.join(MODEL_CONFIG_PATH, "config.json"), 'w') as f:
-                json.dump(config_dict_for_script, f, indent=4)
-            print(f"{Colors.GREEN}✅ Pomyślnie pobrano i zapisano pliki startowe w folderze '{MODEL_CONFIG_PATH}'.{Colors.ENDC}")
-        except Exception as e:
-            print(f"{Colors.RED}❌ KRYTYCZNY BŁĄD: Nie udało się pobrać plików bazowych. Sprawdź połączenie z internetem.{Colors.ENDC}")
-            print(f"Szczegóły błędu: {e}")
-            return # Zatrzymujemy działanie funkcji
+    tokenizer_path = os.path.join(MODEL_CONFIG_PATH, "tokenizer.json")
+    config_path = os.path.join(MODEL_CONFIG_PATH, "config.json")
+
+    if not os.path.isdir(MODEL_CONFIG_PATH) or not os.path.exists(tokenizer_path) or not os.path.exists(config_path):
+        print(f"{Colors.RED}BŁĄD KRYTYCZNY: Folder '{MODEL_CONFIG_PATH}' nie istnieje lub brakuje w nim plików 'config.json' i 'tokenizer.json'.{Colors.ENDC}")
+        print(f"{Colors.YELLOW}Upewnij się, że ten folder zawiera wymaganą konfigurację, ponieważ skrypt nie będzie ich już pobierał automatycznie.{Colors.ENDC}")
+        return
     else:
-        print(f"{Colors.GREEN}INFO: Znaleziono lokalną konfigurację modelu w '{MODEL_CONFIG_PATH}'.{Colors.ENDC}")
-    # ==========================================================================
-    # KONIEC NOWEJ SEKCJI
-    # ==========================================================================
+        print(f"{Colors.GREEN}INFO: Znaleziono konfigurację modelu w '{MODEL_CONFIG_PATH}'. Skrypt użyje plików lokalnych.{Colors.ENDC}")
 
     resume_from_checkpoint = False
     
@@ -198,7 +193,6 @@ def run_pretraining():
         data_files = [f"pl/pl_part_{i:05d}.parquet" for i in range(num_files_to_download)]
         print(f"{Colors.BLUE}INFO: Rozpoczynam pobieranie i przetwarzanie danych...{Colors.ENDC}")
         try:
-            # Teraz ta linia zadziała, bo folder MODEL_CONFIG_PATH jest już gotowy
             tokenizer = AutoTokenizer.from_pretrained(MODEL_CONFIG_PATH)
             
             dataset = load_dataset(DATASET_NAME, data_files=data_files, split="train", streaming=False)
@@ -292,10 +286,10 @@ def upload_to_hub():
         print(f"{Colors.RED}Wystąpił nieoczekiwany błąd: {e}{Colors.ENDC}")
 
 def test_model():
-    # ZMIANA: Sprawdzamy najpierw ostatnio trenowany model. Jeśli go nie ma, używamy domyślnego.
     model_path_to_test = load_last_model_path()
     if model_path_to_test is None:
-        model_path_to_test = "./wytrenowany_model_PL_4L" # Domyślna ścieżka, jeśli nic nie trenowano
+        # Zaktualizowano domyślną ścieżkę, aby pasowała do NUM_LAYERS = 2
+        model_path_to_test = "./wytrenowany_model_PL_2L"
     
     print("\n" + "="*50)
     print(f"{Colors.BOLD}{Colors.BLUE}--- TESTOWANIE MODELU ---{Colors.ENDC}")
@@ -336,7 +330,7 @@ if __name__ == "__main__":
         if LATEST_TRAINED_MODEL_PATH: print(f"[{Colors.GREEN}INFO{Colors.ENDC}] Zapamiętany model: {LATEST_TRAINED_MODEL_PATH}")
         print("1. Trenuj lub wznów trening modelu")
         print("2. Wyślij ostatni model na Hugging Face")
-        print("3. Przetestuj ostatnio trenowany model") # ZMIANA: Lepszy opis
+        print("3. Przetestuj ostatnio trenowany model")
         print("4. Zakończ program")
         print("="*50)
         choice = input(f"{Colors.YELLOW}Wybierz opcję (1-4): {Colors.ENDC}")
