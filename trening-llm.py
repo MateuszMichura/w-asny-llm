@@ -44,29 +44,26 @@ from transformers import (
     GemmaConfig, GemmaForCausalLM, AutoTokenizer, Trainer, TrainingArguments,
     DataCollatorForLanguageModeling, TrainerCallback
 )
-from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
+from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR, get_last_checkpoint
 from huggingface_hub import repo_info, login
 
 # ==============================================================================
-# ZMIANA: BEZPIECZNE LOGOWANIE Z UŻYCIEM ZMIENNEJ ŚRODOWISKOWEJ
+# LOGOWANIE DO HUGGING FACE
 # ==============================================================================
 print("--- Logowanie do Hugging Face ---")
 hf_token = os.getenv("HUGGING_FACE_HUB_TOKEN")
 
 if hf_token is None:
     print("\033[91m❌ BŁĄD: Zmienna środowiskowa 'HUGGING_FACE_HUB_TOKEN' nie została znaleziona.\033[0m")
-    print("\033[93mUstaw zmienną środowiskową, aby kontynuować. Instrukcje znajdziesz w dokumentacji skryptu.\033[0m")
     sys.exit(1)
 
 try:
     login(token=hf_token)
-    print("\033[92m✅ Pomyślnie zalogowano na konto Hugging Face przy użyciu tokena ze zmiennej środowiskowej.\033[0m")
+    print("\033[92m✅ Pomyślnie zalogowano na konto Hugging Face.\033[0m")
 except Exception as e:
     print(f"\033[91m❌ BŁĄD logowania do Hugging Face: {e}\033[0m")
-    print("\033[93mUpewnij się, że token w zmiennej środowiskowej 'HUGGING_FACE_HUB_TOKEN' jest poprawny.\033[0m")
     sys.exit(1)
 print("---------------------------------\n")
-
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
@@ -95,8 +92,7 @@ def get_dir_size_gb(path='.'):
     for dirpath, dirnames, filenames in os.walk(path):
         for f in filenames:
             fp = os.path.join(dirpath, f)
-            if not os.path.islink(fp):
-                total_size += os.path.getsize(fp)
+            if not os.path.islink(fp): total_size += os.path.getsize(fp)
     return total_size / (1024**3)
 
 class ProgressCallback(TrainerCallback):
@@ -105,7 +101,7 @@ class ProgressCallback(TrainerCallback):
     def on_step_end(self, args, state, control, **kwargs):
         duration = time.time() - self.step_start_time
         tokens_in_step = args.per_device_train_batch_size * args.gradient_accumulation_steps * BLOCK_SIZE
-        tokens_per_second = tokens_in_step / duration
+        tokens_per_second = tokens_in_step / duration if duration > 0 else 0
         print(f"  [Krok {state.global_step}] Czas: {duration:.2f}s | Prędkość: {int(tokens_per_second):,} t/s".replace(",", " "), end="\r")
 
 def get_dataset_info(repo_id, lang_prefix="pl/"):
@@ -128,94 +124,94 @@ def get_dataset_info(repo_id, lang_prefix="pl/"):
 def run_pretraining():
     global LATEST_TRAINED_MODEL_PATH
     
-    # === GŁÓWNE USTAWIENIA ===
-    # Ścieżka do folderu z config.json i tokenizer.json.
-    # Ta ścieżka oznacza, że folder 'moj_model' musi być w tym samym miejscu co skrypt .py
     MODEL_CONFIG_PATH = "moj_model"
     DATASET_NAME = "uonlp/CulturaX"
-    # ZMIENIONO LICZBĘ WARSTW
     NUM_LAYERS = 2
     OUTPUT_DIR = f"./wytrenowany_model_PL_{NUM_LAYERS}L"
     PROCESSED_DATA_DIR = os.path.join(OUTPUT_DIR, "processed_dataset")
-    # === KONIEC USTAWIEŃ ===
 
     tokenizer_path = os.path.join(MODEL_CONFIG_PATH, "tokenizer.json")
     config_path = os.path.join(MODEL_CONFIG_PATH, "config.json")
 
     if not os.path.isdir(MODEL_CONFIG_PATH) or not os.path.exists(tokenizer_path) or not os.path.exists(config_path):
-        print(f"{Colors.RED}BŁĄD KRYTYCZNY: Folder '{MODEL_CONFIG_PATH}' nie istnieje lub brakuje w nim plików 'config.json' i 'tokenizer.json'.{Colors.ENDC}")
-        print(f"{Colors.YELLOW}Upewnij się, że ten folder zawiera wymaganą konfigurację, ponieważ skrypt nie będzie ich już pobierał automatycznie.{Colors.ENDC}")
+        print(f"{Colors.RED}BŁĄD KRYTYCZNY: Folder '{MODEL_CONFIG_PATH}' lub jego zawartość nie istnieją.{Colors.ENDC}")
         return
     else:
-        print(f"{Colors.GREEN}INFO: Znaleziono konfigurację modelu w '{MODEL_CONFIG_PATH}'. Skrypt użyje plików lokalnych.{Colors.ENDC}")
+        print(f"{Colors.GREEN}INFO: Znaleziono konfigurację modelu w '{MODEL_CONFIG_PATH}'.{Colors.ENDC}")
 
-    resume_from_checkpoint = False
+    # ==============================================================================
+    # POPRAWIONA LOGIKA WZNAWIANIA TRENINGU
+    # ==============================================================================
+    sciezka_do_wznowienia = None
     
-    if os.path.isdir(OUTPUT_DIR) and glob.glob(os.path.join(OUTPUT_DIR, f"{PREFIX_CHECKPOINT_DIR}-*")):
-        print(f"{Colors.YELLOW}INFO: Znaleziono niedokończony trening w '{OUTPUT_DIR}'.{Colors.ENDC}")
-        while True:
-            choice = input(f"{Colors.YELLOW}Wybierz akcję: [1] Wznów, [2] Zacznij od nowa (usunie postęp), [3] Anuluj: {Colors.ENDC}")
-            if choice == '1':
-                resume_from_checkpoint = True
-                print(f"{Colors.GREEN}Wybrano wznawianie treningu...{Colors.ENDC}")
-                break
-            elif choice == '2':
-                print(f"{Colors.RED}Wybrano rozpoczęcie od nowa. Usuwanie starego postępu...{Colors.ENDC}")
-                shutil.rmtree(OUTPUT_DIR)
-                break
-            elif choice == '3':
-                print("Anulowano.")
-                return
-            else:
-                print(f"{Colors.RED}Nieprawidłowy wybór.{Colors.ENDC}")
+    # NAJPIERW sprawdzamy, czy folder wyjściowy w ogóle istnieje.
+    if os.path.isdir(OUTPUT_DIR):
+        # Dopiero jeśli folder istnieje, szukamy w nim punktów kontrolnych.
+        last_checkpoint_dir = get_last_checkpoint(OUTPUT_DIR)
+        czy_mozna_wznowic = last_checkpoint_dir is not None or os.path.exists(os.path.join(OUTPUT_DIR, "trainer_state.json"))
 
-    if not resume_from_checkpoint:
-        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        if czy_mozna_wznowic:
+            sciezka_do_wznowienia = last_checkpoint_dir if last_checkpoint_dir is not None else OUTPUT_DIR
+            print(f"{Colors.YELLOW}INFO: Znaleziono niedokończony trening w '{sciezka_do_wznowienia}'.{Colors.ENDC}")
+            
+            while True:
+                choice = input(f"{Colors.YELLOW}Wybierz akcję: [1] Wznów, [2] Zacznij od nowa (usunie postęp), [3] Anuluj: {Colors.ENDC}")
+                if choice == '1':
+                    print(f"{Colors.GREEN}Wybrano wznowienie treningu.{Colors.ENDC}")
+                    break
+                elif choice == '2':
+                    print(f"{Colors.RED}Usuwanie starego postępu...{Colors.ENDC}")
+                    shutil.rmtree(OUTPUT_DIR)
+                    sciezka_do_wznowienia = None
+                    break
+                elif choice == '3':
+                    return
+    
+    # Przetwarzanie danych następuje TYLKO wtedy, gdy nie wznawiamy treningu (czyli zaczynamy od zera)
+    if sciezka_do_wznowienia is None:
+        os.makedirs(PROCESSED_DATA_DIR, exist_ok=True)
         print(f"{Colors.BLUE}Sprawdzanie informacji o zbiorze danych '{DATASET_NAME}'...{Colors.ENDC}")
         total_files, total_size_gb, avg_file_size_gb = get_dataset_info(DATASET_NAME)
         
         if total_files is None or total_files == 0: return
-        print(f"{Colors.GREEN}INFO: Cały polski zbiór danych składa się z {total_files} plików ({total_size_gb:.2f} GB).")
-        print(f"      -> Każdy plik ma średnio {avg_file_size_gb:.2f} GB.{Colors.ENDC}")
-
+        print(f"{Colors.GREEN}INFO: Cały polski zbiór danych składa się z {total_files} plików ({total_size_gb:.2f} GB).{Colors.ENDC}")
+        
         num_files_to_download = 0
         while True:
             try:
-                choice_str = input(f"\n{Colors.YELLOW}Podaj, ile plików chcesz pobrać (1-{total_files}). Wpisz 'anuluj', aby wrócić: {Colors.ENDC}")
-                if choice_str.lower() == 'anuluj': return
+                choice_str = input(f"\n{Colors.YELLOW}Podaj, ile plików chcesz pobrać (1-{total_files}): {Colors.ENDC}")
                 choice_files = int(choice_str)
                 if 1 <= choice_files <= total_files:
                     num_files_to_download = choice_files
                     break
-                else: print(f"{Colors.RED}Błąd: Wprowadź liczbę od 1 do {total_files}.{Colors.ENDC}")
-            except ValueError: print(f"{Colors.RED}Błąd: To nie jest poprawna liczba.{Colors.ENDC}")
-
+            except ValueError:
+                print(f"{Colors.RED}Błąd: To nie jest poprawna liczba.{Colors.ENDC}")
+        
         data_files = [f"pl/pl_part_{i:05d}.parquet" for i in range(num_files_to_download)]
-        print(f"{Colors.BLUE}INFO: Rozpoczynam pobieranie i przetwarzanie danych...{Colors.ENDC}")
         try:
+            print(f"{Colors.BLUE}Pobieranie i przetwarzanie danych... To może potrwać.{Colors.ENDC}")
             tokenizer = AutoTokenizer.from_pretrained(MODEL_CONFIG_PATH)
-            
             dataset = load_dataset(DATASET_NAME, data_files=data_files, split="train", streaming=False)
             if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
-            def tokenize_function(e): return tokenizer(e["text"], truncation=True, max_length=BLOCK_SIZE)
-            tokenized_dataset = dataset.map(tokenize_function, batched=True, num_proc=os.cpu_count(), remove_columns=dataset.column_names)
+            def tokenize(e): return tokenizer(e["text"], truncation=True, max_length=BLOCK_SIZE)
+            tokenized = dataset.map(tokenize, batched=True, num_proc=os.cpu_count(), remove_columns=dataset.column_names)
             def group_texts(e):
                 concatenated = {k: sum(e[k], []) for k in e.keys()}
-                total_length = len(concatenated[list(e.keys())[0]])
-                total_length = (total_length // BLOCK_SIZE) * BLOCK_SIZE
-                result = {k: [t[i : i + BLOCK_SIZE] for i in range(0, total_length, BLOCK_SIZE)] for k, t in concatenated.items()}
+                total_length = (len(concatenated[list(e.keys())[0]]) // BLOCK_SIZE) * BLOCK_SIZE
+                result = {k: [t[i:i+BLOCK_SIZE] for i in range(0, total_length, BLOCK_SIZE)] for k, t in concatenated.items()}
                 result["labels"] = result["input_ids"].copy()
                 return result
-            lm_dataset = tokenized_dataset.map(group_texts, batched=True, num_proc=os.cpu_count())
-            print(f"{Colors.BLUE}Zapisywanie przetworzonego zbioru danych na dysk...{Colors.ENDC}")
+            lm_dataset = tokenized.map(group_texts, batched=True, num_proc=os.cpu_count())
             lm_dataset.save_to_disk(PROCESSED_DATA_DIR)
-            data_size = get_dir_size_gb(PROCESSED_DATA_DIR)
-            print(f"{Colors.GREEN}✅ Zapisano. Przetworzone dane zajmują {data_size:.2f} GB miejsca na dysku.{Colors.ENDC}")
+            print(f"{Colors.GREEN}✅ Dane zostały pomyślnie przetworzone i zapisane w '{PROCESSED_DATA_DIR}'.{Colors.ENDC}")
         except Exception as e:
             print(f"{Colors.RED}❌ BŁĄD podczas przetwarzania danych: {e}{Colors.ENDC}")
             return
-            
-    with open(os.path.join(MODEL_CONFIG_PATH, "config.json"), 'r') as f:
+    else:
+        print(f"{Colors.GREEN}INFO: Pomijam przetwarzanie danych, ponieważ trening jest wznawiany.{Colors.ENDC}")
+    
+    # --- KONFIGURACJA MODELU I TRENERA ---
+    with open(config_path, 'r') as f:
         config = GemmaConfig(**json.load(f)['text_config'])
     config.num_hidden_layers = NUM_LAYERS
     model = GemmaForCausalLM(config)
@@ -223,42 +219,38 @@ def run_pretraining():
     tokenizer = AutoTokenizer.from_pretrained(MODEL_CONFIG_PATH)
     if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
 
-    print(f"{Colors.BLUE}INFO: Ładowanie przetworzonego zbioru danych z dysku...{Colors.ENDC}")
     if not os.path.isdir(PROCESSED_DATA_DIR):
-        print(f"{Colors.RED}BŁĄD: Nie znaleziono folderu z przetworzonymi danymi: {PROCESSED_DATA_DIR}{Colors.ENDC}")
+        print(f"{Colors.RED}BŁĄD: Nie znaleziono folderu z przetworzonymi danymi: {PROCESSED_DATA_DIR}. Coś poszło nie tak.{Colors.ENDC}")
         return
-    lm_dataset = load_from_disk(PROCESSED_DATA_DIR)
-    data_size = get_dir_size_gb(PROCESSED_DATA_DIR)
-    print(f"{Colors.GREEN}✅ Załadowano dane ({data_size:.2f} GB).{Colors.ENDC}")
     
-    training_args = TrainingArguments(output_dir=OUTPUT_DIR, overwrite_output_dir=False, num_train_epochs=1, per_device_train_batch_size=1, gradient_accumulation_steps=16, bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported(), gradient_checkpointing=True, logging_steps=20, save_steps=1000, save_total_limit=2)
+    print(f"{Colors.BLUE}INFO: Ładowanie przetworzonego zbioru danych z dysku...{Colors.ENDC}")
+    lm_dataset = load_from_disk(PROCESSED_DATA_DIR)
+    
+    training_args = TrainingArguments(output_dir=OUTPUT_DIR, overwrite_output_dir=False, num_train_epochs=1, per_device_train_batch_size=1, gradient_accumulation_steps=16, bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported(), gradient_checkpointing=True, logging_steps=20, save_steps=1000, save_total_limit=3)
     trainer = Trainer(model=model, args=training_args, train_dataset=lm_dataset, data_collator=DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False), callbacks=[ProgressCallback()])
 
     try:
         print(f"\n{Colors.BOLD}{Colors.GREEN}!!! ROZPOCZYNAM PRE-TRENING !!!{Colors.ENDC}")
-        print(f"{Colors.YELLOW}Naciśnij Ctrl+C w dowolnym momencie, aby bezpiecznie przerwać i zapisać model.{Colors.ENDC}")
-        trainer.train(resume_from_checkpoint=resume_from_checkpoint)
+        print(f"{Colors.YELLOW}Naciśnij Ctrl+C, aby bezpiecznie przerwać i zapisać model.{Colors.ENDC}")
+        trainer.train(resume_from_checkpoint=sciezka_do_wznowienia)
         print(f"\n{Colors.BOLD}{Colors.GREEN}!!! PRE-TRENING ZAKOŃCZONY !!!{Colors.ENDC}\n")
         trainer.save_model(OUTPUT_DIR)
         tokenizer.save_pretrained(OUTPUT_DIR)
         LATEST_TRAINED_MODEL_PATH = OUTPUT_DIR
         save_last_model_path(OUTPUT_DIR)
-        print(f"{Colors.YELLOW}Model końcowy zapisany w: {OUTPUT_DIR}{Colors.ENDC}")
+    
     except KeyboardInterrupt:
         print(f"\n{Colors.RED}Przerwano trening przez użytkownika (Ctrl+C).{Colors.ENDC}")
-        print(f"{Colors.YELLOW}Zapisywanie pełnego stanu trenera...{Colors.ENDC}")
-        trainer.save_state()
-        trainer.save_model() 
-        checkpoint_folder = os.path.join(OUTPUT_DIR, f"{PREFIX_CHECKPOINT_DIR}-{trainer.state.global_step}")
-        if not os.path.exists(checkpoint_folder):
-             os.makedirs(checkpoint_folder, exist_ok=True)
-             shutil.copy(os.path.join(OUTPUT_DIR, "trainer_state.json"), checkpoint_folder)
-             shutil.copy(os.path.join(OUTPUT_DIR, "optimizer.pt"), checkpoint_folder)
-             shutil.copy(os.path.join(OUTPUT_DIR, "scheduler.pt"), checkpoint_folder)
-
-        checkpoint_size = get_dir_size_gb(OUTPUT_DIR)
-        print(f"{Colors.GREEN}✅ Stan treningu i model zapisany ({checkpoint_size:.2f} GB). Program zostanie zamknięty.{Colors.ENDC}")
+        print(f"{Colors.YELLOW}Zapisywanie punktu kontrolnego...{Colors.ENDC}")
+        try:
+            trainer.save_model()
+            trainer.save_state()
+            print(f"{Colors.GREEN}✅ Pomyślnie zapisano postęp w '{OUTPUT_DIR}'.{Colors.ENDC}")
+        except Exception as e:
+            print(f"{Colors.RED}❌ BŁĄD podczas zapisywania: {e}{Colors.ENDC}")
+        
         save_last_model_path(OUTPUT_DIR)
+        print(f"{Colors.BLUE}Program zostanie zamknięty.{Colors.ENDC}")
         sys.exit(0)
 
 def upload_to_hub():
@@ -286,10 +278,11 @@ def upload_to_hub():
         print(f"{Colors.RED}Wystąpił nieoczekiwany błąd: {e}{Colors.ENDC}")
 
 def test_model():
+    NUM_LAYERS = 8 
     model_path_to_test = load_last_model_path()
+    default_path = f"./wytrenowany_model_PL_{NUM_LAYERS}L"
     if model_path_to_test is None:
-        # Zaktualizowano domyślną ścieżkę, aby pasowała do NUM_LAYERS = 2
-        model_path_to_test = "./wytrenowany_model_PL_2L"
+        model_path_to_test = default_path
     
     print("\n" + "="*50)
     print(f"{Colors.BOLD}{Colors.BLUE}--- TESTOWANIE MODELU ---{Colors.ENDC}")
@@ -298,7 +291,6 @@ def test_model():
     
     if not os.path.isdir(model_path_to_test):
         print(f"{Colors.RED}BŁĄD: Nie znaleziono folderu z modelem '{model_path_to_test}'.{Colors.ENDC}")
-        print(f"{Colors.YELLOW}Upewnij się, że model został już wytrenowany lub zmień ścieżkę w kodzie.{Colors.ENDC}")
         return
     try:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
